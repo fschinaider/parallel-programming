@@ -2,8 +2,10 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
-#include <pthread.h>
 #include <time.h>
+#include <omp.h>
+
+int contador_total = 0;
 
 typedef struct Nodo {
     int vertice;
@@ -20,13 +22,6 @@ typedef struct Lista {
     int tamanho;
     struct Lista* prox;
 } Lista;
-
-typedef struct ThreadData {
-    Grafo* g;
-    int k;
-    int* contador;
-    Lista** trabalhos;
-} ThreadData;
 
 Nodo* criar_nodo(int vertice) {
     Nodo* novo_nodo = (Nodo*)malloc(sizeof(Nodo));
@@ -55,19 +50,18 @@ void adicionar_aresta(Grafo* g, int u, int v) {
     g->adj[v] = novo_nodo_u;
 }
 
-void carregar_grafo_de_arquivo(Grafo* g, const char* nome_arquivo) {
+void carregar_grafo(Grafo* g, const char* nome_arquivo) {
     FILE* arquivo = fopen(nome_arquivo, "r");
     if (arquivo == NULL) {
-        printf("Erro ao abrir o arquivo!\n");
+        perror("Erro ao abrir o arquivo");
         exit(EXIT_FAILURE);
     }
 
     int u, v;
     while (fscanf(arquivo, "%d %d", &u, &v) != EOF) {
-        if (u < 0 || u >= g->V || v < 0 || v >= g->V) {
-            continue;
+        if (u >= 0 && u < g->V && v >= 0 && v < g->V) {
+            adicionar_aresta(g, u, v);
         }
-        adicionar_aresta(g, u, v);
     }
     fclose(arquivo);
 }
@@ -75,9 +69,7 @@ void carregar_grafo_de_arquivo(Grafo* g, const char* nome_arquivo) {
 Lista* criar_lista(int* clique, int tamanho) {
     Lista* nova_lista = (Lista*)malloc(sizeof(Lista));
     nova_lista->vertices = (int*)malloc(tamanho * sizeof(int));
-    for (int i = 0; i < tamanho; i++) {
-        nova_lista->vertices[i] = clique[i];
-    }
+    memcpy(nova_lista->vertices, clique, tamanho * sizeof(int));
     nova_lista->tamanho = tamanho;
     nova_lista->prox = NULL;
     return nova_lista;
@@ -90,6 +82,7 @@ void empilhar(Lista** cliques, int* clique, int tamanho) {
 }
 
 Lista* desempilhar(Lista** cliques) {
+    if (*cliques == NULL) return NULL;
     Lista* topo = *cliques;
     *cliques = (*cliques)->prox;
     return topo;
@@ -125,91 +118,88 @@ bool contem(int* array, int tamanho, int elemento) {
     return false;
 }
 
-void* contagem_de_cliques_thread(void* arg) {
-    ThreadData* data = (ThreadData*)arg;
-    Grafo* g = data->g;
-    int k = data->k;
-    Lista* cliques = *data->trabalhos;
-    int* contador = data->contador;
+int contagem_de_cliques_parallel(Grafo* g, int k, int num_threads, int maxv_roubado) {
+    Lista** cliques = malloc(num_threads * sizeof(Lista*));
+    if (cliques == NULL) {
+        fprintf(stderr, "Erro ao alocar memória para cliques\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    for (int i = 0; i < num_threads; i++) {
+        cliques[i] = NULL;
+    }
 
-    while (cliques != NULL) {
-        Lista* clique_atual = desempilhar(&cliques);
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int id = omp_get_thread_num();
+        int local_contador = 0;
+        Lista* thread_cliques = NULL;
 
-        if (clique_atual->tamanho == k) {
-            (*contador)++;
-            free(clique_atual->vertices);
-            free(clique_atual);
-            continue;
+        // Inicializa a pilha local com os vértices
+        #pragma omp for
+        for (int v = 0; v < g->V; v++) {
+            int clique_inicial[] = {v};
+            empilhar(&thread_cliques, clique_inicial, 1);
         }
 
-        int ultimo_vertice = clique_atual->vertices[clique_atual->tamanho - 1];
+        while (true) {
+            Lista* clique_atual = desempilhar(&thread_cliques);
 
-        for (int vizinho = ultimo_vertice + 1; vizinho < g->V; vizinho++) {
-            if (!contem(clique_atual->vertices, clique_atual->tamanho, vizinho) 
-                && conexao_completa(g, clique_atual->vertices, clique_atual->tamanho, vizinho)) {
-                int nova_clique[clique_atual->tamanho + 1];
-                for (int j = 0; j < clique_atual->tamanho; j++) {
-                    nova_clique[j] = clique_atual->vertices[j];
+            if (clique_atual == NULL) {
+                // Tentar roubar trabalho de outras threads
+                bool roubou_trabalho = false;
+                for (int i = 0; i < num_threads; i++) {
+                    if (i != id && cliques[i] != NULL) {
+                        #pragma omp critical
+                        {
+                            // Checa se a lista de outra thread tem cliques para roubar
+                            if (cliques[i] != NULL) {
+                                Lista* roubado = desempilhar(&cliques[i]);
+                                if (roubado != NULL) {
+                                    empilhar(&thread_cliques, roubado->vertices, roubado->tamanho);
+                                    roubou_trabalho = true;
+                                    // Não liberamos 'roubado' aqui
+                                }
+                            }
+                        }
+                    }
+                    if (roubou_trabalho) break;
                 }
-                nova_clique[clique_atual->tamanho] = vizinho;
-                empilhar(&cliques, nova_clique, clique_atual->tamanho + 1);
+
+                if (thread_cliques == NULL) {
+                    break; // Se ainda não tiver cliques, sair
+                }
+            }
+
+            if (clique_atual != NULL) {
+                if (clique_atual->tamanho == k) {
+                    local_contador++;
+                } else {
+                    int ultimo_vertice = clique_atual->vertices[clique_atual->tamanho - 1];
+                    for (int vizinho = ultimo_vertice + 1; vizinho < g->V; vizinho++) {
+                        if (!contem(clique_atual->vertices, clique_atual->tamanho, vizinho) &&
+                            conexao_completa(g, clique_atual->vertices, clique_atual->tamanho, vizinho)) {
+                            int nova_clique[clique_atual->tamanho + 1];
+                            memcpy(nova_clique, clique_atual->vertices, clique_atual->tamanho * sizeof(int));
+                            nova_clique[clique_atual->tamanho] = vizinho;
+
+                            empilhar(&thread_cliques, nova_clique, clique_atual->tamanho + 1);
+                        }
+                    }
+                }
+
+                free(clique_atual->vertices);
+                free(clique_atual);
             }
         }
 
-        free(clique_atual->vertices);
-        free(clique_atual);
-    }
-    return NULL;
-}
-
-int contagem_de_cliques_paralela(Grafo* g, int k, int num_threads) {
-    Lista* cliques = NULL;
-    pthread_t threads[num_threads];
-    ThreadData dados[num_threads];
-    int contadores[num_threads];
-
-    for (int i = 0; i < num_threads; i++) {
-        contadores[i] = 0;
+        // Somar a contagem local na variável global
+        #pragma omp atomic
+        contador_total += local_contador;
     }
 
-    for (int v = 0; v < g->V; v++) {
-        int clique_inicial[] = {v};
-        empilhar(&cliques, clique_inicial, 1);
-    }
-
-    Lista* trabalho_por_thread[num_threads];
-    for (int i = 0; i < num_threads; i++) {
-        trabalho_por_thread[i] = NULL;
-    }
-
-    Lista* atual = cliques;
-    int indice = 0;
-    while (atual != NULL) {
-        Lista* proximo = atual->prox;
-        atual->prox = trabalho_por_thread[indice];
-        trabalho_por_thread[indice] = atual;
-        indice = (indice + 1) % num_threads;
-        atual = proximo;
-    }
-
-    for (int i = 0; i < num_threads; i++) {
-        dados[i].g = g;
-        dados[i].k = k;
-        dados[i].contador = &contadores[i];
-        dados[i].trabalhos = &trabalho_por_thread[i];
-        pthread_create(&threads[i], NULL, contagem_de_cliques_thread, &dados[i]);
-    }
-
-    for (int i = 0; i < num_threads; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    int total_contador = 0;
-    for (int i = 0; i < num_threads; i++) {
-        total_contador += contadores[i];
-    }
-
-    return total_contador;
+    free(cliques);
+    return contador_total;
 }
 
 void liberar_grafo(Grafo* g) {
@@ -225,51 +215,70 @@ void liberar_grafo(Grafo* g) {
     free(g);
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s <dataset> <k> <num_threads>\n", argv[0]);
-        return 1;
+void exibir_uso(const char *nome_programa) {
+    fprintf(stderr, "Uso: %s <dataset> <k> <num_threads> <maxv_roubado>\n", nome_programa);
+}
+
+int obter_num_vertices(const char *dataset) {
+    const char *datasets[] = {"citeseer", "ca_astroph", "dblp"};
+    const int num_vertices[] = {3312, 18772, 317080};
+    for (int i = 0; i < 3; i++) {
+        if (strcmp(dataset, datasets[i]) == 0) {
+            return num_vertices[i];
+        }
     }
+    fprintf(stderr, "Dataset não suportado: %s\n", dataset);
+    return -1;
+}
 
-    char dataset[30];
-    int k, num_threads;
-    strcpy(dataset, argv[1]);
-    k = atoi(argv[2]);
-    num_threads = atoi(argv[2]);
-    struct timespec start_time, end_time;
-
-    int num_vertices;
-    if (strcmp(dataset, "citeseer") == 0) {
-        num_vertices = 3312;
-    } else if (strcmp(dataset, "ca_astroph") == 0) {
-        num_vertices = 18772;
-    } else if (strcmp(dataset, "dblp") == 0) {
-        num_vertices = 317080;
-    } else {
-        return 1;
+Grafo* inicializar_grafo(const char *dataset) {
+    int num_vertices = obter_num_vertices(dataset);
+    if (num_vertices == -1) {
+        return NULL; // Retorna NULL em caso de erro
     }
-
-    Grafo* g = criar_grafo(num_vertices);
 
     char arquivo[110];
     snprintf(arquivo, sizeof(arquivo), "%s.edgelist", dataset);
 
-    carregar_grafo_de_arquivo(g, arquivo);
+    Grafo *g = criar_grafo(num_vertices);
+    carregar_grafo(g, arquivo); // Chamada direta à nova função de carregar o grafo
+
+    return g;
+}
+
+void medir_tempo_execucao(Grafo *g, int k, int num_threads, int maxv_roubado) {
+    struct timespec start_time, end_time;
 
     clock_gettime(CLOCK_MONOTONIC, &start_time);
-
-    int resultado = contagem_de_cliques_paralela(g, k, num_threads);
-
+    int total_cliques = contagem_de_cliques_parallel(g, k, num_threads, maxv_roubado);
     clock_gettime(CLOCK_MONOTONIC, &end_time);
-    
-    double time_spent = (end_time.tv_sec - start_time.tv_sec) + 
-                        (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
-    printf("Tempo de execução: %.6f segundos\n", time_spent);
+    double tempo_total = (end_time.tv_sec - start_time.tv_sec) +
+                         (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
-    printf("Número de cliques de tamanho %d: %d\n", k, resultado);
+    printf("Total de cliques de tamanho %d: %d\n", k, total_cliques);
+    printf("Tempo total de execução: %.2f segundos\n", tempo_total);
+}
 
+int main(int argc, char *argv[]) {
+    if (argc != 5) {
+        exibir_uso(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const char *dataset = argv[1];
+    int k = atoi(argv[2]);
+    int num_threads = atoi(argv[3]);
+    int maxv_roubado = atoi(argv[4]);
+
+    Grafo *g = inicializar_grafo(dataset);
+    if (g == NULL) {
+        fprintf(stderr, "Falha ao inicializar o grafo.\n");
+        return EXIT_FAILURE;
+    }
+
+    medir_tempo_execucao(g, k, num_threads, maxv_roubado);
     liberar_grafo(g);
 
-    return 0;
+    return EXIT_SUCCESS;
 }
